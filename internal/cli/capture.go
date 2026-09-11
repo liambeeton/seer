@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -16,6 +19,7 @@ import (
 
 // captureOptions are the capture verb's flags.
 type captureOptions struct {
+	targetFile  string
 	storeDir    string
 	jsonl       bool
 	browserPath string
@@ -25,14 +29,19 @@ type captureOptions struct {
 func newCaptureCmd() *cobra.Command {
 	var opts captureOptions
 	cmd := &cobra.Command{
-		Use:   "capture <url>...",
+		Use:   "capture [url]...",
 		Short: "Visit each Target once and record a Capture into a Store",
-		Args:  cobra.MinimumNArgs(1),
+		Long: "Visit each Target once and record a Capture into a Store.\n\n" +
+			"Targets are read from the URLs given as arguments, from -f, or from\n" +
+			"stdin when neither is given. A bare host becomes both an http:// and\n" +
+			"an https:// Target; a line that names a scheme is visited as written.",
+		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCapture(cmd, opts, args)
 		},
 	}
 	f := cmd.Flags()
+	f.StringVarP(&opts.targetFile, "file", "f", "", "file to read Targets from, one per line")
 	f.StringVarP(&opts.storeDir, "store", "o", "./seer-store", "Store directory (created on first use)")
 	f.BoolVar(&opts.jsonl, "jsonl", false, "write one JSON object per Capture to stdout as it completes")
 	f.StringVar(&opts.browserPath, "browser-path", "", "Chrome/Chromium binary to use instead of looking one up")
@@ -40,13 +49,61 @@ func newCaptureCmd() *cobra.Command {
 	return cmd
 }
 
+// targetLines gathers the input lines to parse: the URLs given as arguments
+// and the lines of -f, or stdin when neither was given. Whichever it reads,
+// nothing here judges a line; target.Parse does that.
+func targetLines(stdin io.Reader, urls []string, file string) ([]string, error) {
+	lines := append([]string(nil), urls...)
+
+	var src io.Reader
+	name := "stdin"
+	switch {
+	case file != "":
+		f, err := os.Open(file)
+		if err != nil {
+			return nil, fmt.Errorf("reading Targets: %w", err)
+		}
+		defer f.Close()
+		src, name = f, file
+	case len(urls) == 0:
+		src = stdin
+	default:
+		return lines, nil
+	}
+
+	read, err := readLines(src)
+	if err != nil {
+		return nil, fmt.Errorf("reading Targets from %s: %w", name, err)
+	}
+	return append(lines, read...), nil
+}
+
+// readLines reads a Target list line by line. bufio.Scanner's default 64 KiB
+// line limit is left in place: a longer line is a file that is not a Target
+// list, and saying so beats reading it into memory.
+func readLines(r io.Reader) ([]string, error) {
+	var lines []string
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
+}
+
 func runCapture(cmd *cobra.Command, opts captureOptions, urls []string) error {
 	ctx := cmd.Context()
 	stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 
-	targets, err := target.Parse(urls)
+	lines, err := targetLines(cmd.InOrStdin(), urls, opts.targetFile)
 	if err != nil {
 		return exitWith(ExitUsage, err)
+	}
+	targets, err := target.Parse(lines)
+	if err != nil {
+		return exitWith(ExitUsage, err)
+	}
+	if len(targets) == 0 {
+		return exitWith(ExitUsage, errors.New("no Targets given; pass URLs as arguments, with -f, or on stdin"))
 	}
 
 	browser, err := capture.Launch(ctx, capture.BrowserOptions{
@@ -71,15 +128,16 @@ func runCapture(cmd *cobra.Command, opts captureOptions, urls []string) error {
 	}
 
 	done := 0
-	for i, t := range targets {
+	for _, t := range targets {
 		captured, err := browser.Visit(ctx, t.URL)
 		if err != nil {
 			return abort(st, run.ID, err)
 		}
 		stored, err := st.AppendCapture(ctx, store.Capture{
 			RunID:      run.ID,
-			Position:   i + 1,
+			Position:   t.Position,
 			Target:     t.URL,
+			InputLine:  t.InputLine,
 			Status:     captureStatus(captured),
 			Error:      captured.Error,
 			Response:   storeResponse(captured.Response),
@@ -150,6 +208,7 @@ type jsonlCapture struct {
 	RunID          string         `json:"run_id"`
 	Position       int            `json:"position"`
 	Target         string         `json:"target"`
+	InputLine      string         `json:"input_line"`
 	Status         string         `json:"status"`
 	Error          *string        `json:"error"`
 	Response       *jsonlResponse `json:"response"`
@@ -170,6 +229,7 @@ func writeJSONL(w io.Writer, c store.Capture) error {
 		RunID:          c.RunID,
 		Position:       c.Position,
 		Target:         c.Target,
+		InputLine:      c.InputLine,
 		Status:         string(c.Status),
 		Error:          nullable(c.Error),
 		ScreenshotPath: nullable(c.ScreenshotPath),

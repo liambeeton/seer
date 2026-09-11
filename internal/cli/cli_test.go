@@ -31,8 +31,14 @@ type invocation struct {
 // seer runs one invocation through the cli.Run seam with an empty stdin.
 func seer(t *testing.T, args ...string) invocation {
 	t.Helper()
+	return seerStdin(t, "", args...)
+}
+
+// seerStdin runs one invocation through the cli.Run seam with stdin piped in.
+func seerStdin(t *testing.T, stdin string, args ...string) invocation {
+	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := cli.Run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
+	code := cli.Run(context.Background(), args, strings.NewReader(stdin), &stdout, &stderr)
 	t.Logf("seer %s\n  exit %d\n  stdout: %q\n  stderr: %q", strings.Join(args, " "), code, stdout.String(), stderr.String())
 	return invocation{stdout: stdout.String(), stderr: stderr.String(), code: code}
 }
@@ -78,6 +84,7 @@ type jsonlCapture struct {
 	RunID          string         `json:"run_id"`
 	Position       int            `json:"position"`
 	Target         string         `json:"target"`
+	InputLine      string         `json:"input_line"`
 	Status         string         `json:"status"`
 	Error          *string        `json:"error"`
 	Response       *jsonlResponse `json:"response"`
@@ -330,32 +337,194 @@ func TestCapture_WithoutJSONLStdoutStaysEmpty(t *testing.T) {
 	}
 }
 
-func TestCapture_TargetWithoutSchemeIsRejectedBeforeAnyVisit(t *testing.T) {
-	store := filepath.Join(t.TempDir(), "store")
-
-	r := seer(t, append([]string{"capture", "https://ok.test/", "example.test", "-o", store, "--jsonl"}, browserFlags()...)...)
-
-	if r.code != 1 {
-		t.Errorf("exit code = %d, want 1", r.code)
-	}
-	if !strings.Contains(r.stderr, "example.test") {
-		t.Errorf("stderr should name the offending line, got %q", r.stderr)
-	}
-	if r.stdout != "" {
-		t.Errorf("stdout = %q, want empty", r.stdout)
-	}
-	assertNoStore(t, store)
-}
-
 func TestCapture_HelpDescribesFlags(t *testing.T) {
 	r := seer(t, "capture", "--help")
 
 	if r.code != 0 {
 		t.Errorf("exit code = %d, want 0", r.code)
 	}
-	for _, want := range []string{"-o", "./seer-store", "--jsonl", "--browser-path", "--no-download"} {
+	for _, want := range []string{"-o", "./seer-store", "-f", "--jsonl", "--browser-path", "--no-download"} {
 		if !strings.Contains(r.stdout, want) {
 			t.Errorf("help should mention %q, got:\n%s", want, r.stdout)
 		}
 	}
+}
+
+// targetFile writes lines to a file in a temporary directory and returns its
+// path, the way an operator feeds seer a scope list.
+func targetFile(t *testing.T, lines ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "scope.txt")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// wantTarget is one expected Capture's provenance: where it sits in the visit
+// order, the Target it visits, and the input line it was expanded from.
+type wantTarget struct {
+	position  int
+	target    string
+	inputLine string
+}
+
+func assertTargets(t *testing.T, cs []jsonlCapture, want []wantTarget) {
+	t.Helper()
+	if len(cs) != len(want) {
+		t.Errorf("got %d Captures, want %d", len(cs), len(want))
+		for i, c := range cs {
+			t.Logf("  got [%d] position %d %s (from %q)", i, c.Position, c.Target, c.InputLine)
+		}
+	}
+	for i, w := range want {
+		if i >= len(cs) {
+			t.Errorf("missing Capture for %s (from %q)", w.target, w.inputLine)
+			continue
+		}
+		c := cs[i]
+		if c.Position != w.position || c.Target != w.target || c.InputLine != w.inputLine {
+			t.Errorf("Capture %d = position %d %s (from %q), want position %d %s (from %q)",
+				i, c.Position, c.Target, c.InputLine, w.position, w.target, w.inputLine)
+		}
+	}
+}
+
+// TestCapture_ExpandsNormalisesAndDedupesInputLines batches every input rule
+// into one invocation: unresolvable .invalid hosts make each visit a fast,
+// network-free failed Capture whose Target URL still shows what the rules did.
+func TestCapture_ExpandsNormalisesAndDedupesInputLines(t *testing.T) {
+	list := targetFile(t,
+		"",
+		"  acme.invalid  ",
+		"ACME.invalid",
+		"HTTPS://Acme.Invalid:443/",
+		"acme.invalid/",
+		"hosted.invalid:8080",
+		"port80.invalid:80",
+		"http://paths.invalid",
+		"HTTP://Case.invalid/Mixed/Path?Q=1#Frag",
+		"münchen.invalid",
+		"[::1]:9999",
+		"",
+	)
+	store := filepath.Join(t.TempDir(), "store")
+
+	args := append([]string{"capture", "https://first.invalid/", "-f", list, "-o", store, "--jsonl"}, browserFlags()...)
+	r := seer(t, args...)
+
+	if r.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %s", r.code, r.stderr)
+	}
+	assertTargets(t, captures(t, r.stdout), []wantTarget{
+		// Positional URLs are visited before the file's lines.
+		{1, "https://first.invalid/", "https://first.invalid/"},
+		// A bare host becomes both schemes; surrounding whitespace is ignored.
+		{2, "http://acme.invalid/", "acme.invalid"},
+		{3, "https://acme.invalid/", "acme.invalid"},
+		// ACME.invalid, HTTPS://Acme.Invalid:443/ and acme.invalid/ name those
+		// same two Targets: host case, scheme case, a scheme-default port and
+		// a bare host's trailing slash all dedupe away, and the first
+		// occurrence keeps its position.
+		{4, "http://hosted.invalid:8080/", "hosted.invalid:8080"},
+		{5, "https://hosted.invalid:8080/", "hosted.invalid:8080"},
+		// A port that is the default for one scheme is dropped only there.
+		{6, "http://port80.invalid/", "port80.invalid:80"},
+		{7, "https://port80.invalid:80/", "port80.invalid:80"},
+		// A line with a scheme is one Target, gaining only a path of "/".
+		{8, "http://paths.invalid/", "http://paths.invalid"},
+		// Scheme and host lowercase; path, query and fragment untouched.
+		{9, "http://case.invalid/Mixed/Path?Q=1#Frag", "HTTP://Case.invalid/Mixed/Path?Q=1#Frag"},
+		// IDN hosts survive as written rather than being percent-escaped.
+		{10, "http://münchen.invalid/", "münchen.invalid"},
+		{11, "https://münchen.invalid/", "münchen.invalid"},
+		// IPv6 literals stay in their brackets.
+		{12, "http://[::1]:9999/", "[::1]:9999"},
+		{13, "https://[::1]:9999/", "[::1]:9999"},
+	})
+}
+
+func TestCapture_ReadsTargetsFromStdinWhenGivenNeitherArgsNorFile(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "store")
+
+	args := append([]string{"capture", "-o", store, "--jsonl"}, browserFlags()...)
+	r := seerStdin(t, "http://one.invalid/\n\n  two.invalid  \n", args...)
+
+	if r.code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %s", r.code, r.stderr)
+	}
+	assertTargets(t, captures(t, r.stdout), []wantTarget{
+		{1, "http://one.invalid/", "http://one.invalid/"},
+		{2, "http://two.invalid/", "two.invalid"},
+		{3, "https://two.invalid/", "two.invalid"},
+	})
+}
+
+// TestCapture_UnparseableLineAbortsBeforeAnythingIsVisited covers the input
+// errors that must cost nothing: no Run, no Store, no visit.
+func TestCapture_UnparseableLineAbortsBeforeAnythingIsVisited(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		line string
+	}{
+		{"CIDR range", "10.0.0.0/24"},
+		{"unbracketed IPv6", "2001:db8::1"},
+		{"garbage", "not a host"},
+		{"wildcard", "*.acme.invalid"},
+		{"bad port", "acme.invalid:http"},
+		{"port out of range", "acme.invalid:99999"},
+		{"credentials", "http://operator:s3cret@acme.invalid/"},
+		{"unsupported scheme", "ftp://acme.invalid/"},
+		{"scheme without a host", "http://"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			list := targetFile(t, "http://fine.invalid/", tc.line)
+			store := filepath.Join(t.TempDir(), "store")
+
+			args := append([]string{"capture", "-f", list, "-o", store, "--jsonl"}, browserFlags()...)
+			r := seer(t, args...)
+
+			if r.code != 1 {
+				t.Errorf("exit code = %d, want 1; stderr: %s", r.code, r.stderr)
+			}
+			if !strings.Contains(r.stderr, tc.line) {
+				t.Errorf("stderr should name the offending line %q, got %q", tc.line, r.stderr)
+			}
+			if r.stdout != "" {
+				t.Errorf("stdout = %q, want empty: nothing may be visited", r.stdout)
+			}
+			assertNoStore(t, store)
+		})
+	}
+}
+
+func TestCapture_NoTargetsIsAUsageError(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "store")
+
+	args := append([]string{"capture", "-o", store}, browserFlags()...)
+	r := seerStdin(t, "\n   \n", args...)
+
+	if r.code != 1 {
+		t.Errorf("exit code = %d, want 1; stderr: %s", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stderr, "no Targets") {
+		t.Errorf("stderr should say no Targets were given, got %q", r.stderr)
+	}
+	assertNoStore(t, store)
+}
+
+func TestCapture_UnreadableTargetFileIsAUsageError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-scope.txt")
+	store := filepath.Join(t.TempDir(), "store")
+
+	args := append([]string{"capture", "-f", missing, "-o", store}, browserFlags()...)
+	r := seer(t, args...)
+
+	if r.code != 1 {
+		t.Errorf("exit code = %d, want 1; stderr: %s", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stderr, missing) {
+		t.Errorf("stderr should name the unreadable file %q, got %q", missing, r.stderr)
+	}
+	assertNoStore(t, store)
 }

@@ -67,11 +67,14 @@ type Response struct {
 type Capture struct {
 	ID       string
 	RunID    string
-	Position int // input order, starting at 1
+	Position int // visit order, starting at 1
 	Target   string
-	Status   CaptureStatus
-	Error    string    // failure reason; empty when succeeded
-	Response *Response // nil when nothing came back
+	// InputLine is the input line the Target was expanded from, kept so a
+	// Report can explain why one line became two Captures.
+	InputLine string
+	Status    CaptureStatus
+	Error     string    // failure reason; empty when succeeded
+	Response  *Response // nil when nothing came back
 	// ScreenshotPath is relative to the Store, slash-separated; empty when
 	// there is no Screenshot.
 	ScreenshotPath string
@@ -98,6 +101,7 @@ CREATE TABLE IF NOT EXISTS captures (
 	run_id          TEXT NOT NULL REFERENCES runs(id),
 	position        INTEGER NOT NULL,
 	target_url      TEXT NOT NULL,
+	input_line      TEXT NOT NULL,
 	status          TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),
 	error           TEXT,
 	http_status     INTEGER,
@@ -190,9 +194,9 @@ func (s *Store) AppendCapture(ctx context.Context, c Capture, screenshot []byte)
 	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO captures
-			(id, run_id, position, target_url, status, error, http_status, final_url, title, screenshot_path, started_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.RunID, c.Position, c.Target, c.Status, nullIfEmpty(c.Error),
+			(id, run_id, position, target_url, input_line, status, error, http_status, final_url, title, screenshot_path, started_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.RunID, c.Position, c.Target, c.InputLine, c.Status, nullIfEmpty(c.Error),
 		httpStatus, finalURL, title, nullIfEmpty(c.ScreenshotPath),
 		FormatTime(c.StartedAt), FormatTime(c.FinishedAt))
 	if err != nil {
