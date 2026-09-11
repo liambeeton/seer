@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -56,11 +57,56 @@ type Run struct {
 	TargetCount int
 }
 
+// Timestamp is a time the Store keeps inside a JSON column, written the way
+// the Store writes every other timestamp so that a time in JSON looks like a
+// time in a column of its own.
+type Timestamp time.Time
+
+// MarshalJSON writes the timestamp in the Store's layout.
+func (t Timestamp) MarshalJSON() ([]byte, error) {
+	return json.Marshal(FormatTime(time.Time(t)))
+}
+
+// Hop is one step of a redirect chain: the URL that was requested and the
+// status it answered with.
+type Hop struct {
+	URL    string `json:"url"`
+	Status int    `json:"status"`
+}
+
+// Header is one response header, exactly as it came over the wire.
+type Header struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// TLS is the certificate the Target served and the browser's verdict on it.
+type TLS struct {
+	Subject   string    `json:"subject"`
+	SANs      []string  `json:"sans"`
+	Issuer    string    `json:"issuer"`
+	ValidFrom Timestamp `json:"valid_from"`
+	ValidTo   Timestamp `json:"valid_to"`
+	Protocol  string    `json:"protocol"`
+	Cipher    string    `json:"cipher"`
+	// Trusted is whether the browser accepted the certificate.
+	Trusted bool `json:"trusted"`
+	// Reason is why it did not; empty when it did.
+	Reason string `json:"reason"`
+}
+
 // Response is what the Target's server returned during a Capture's visit.
 type Response struct {
 	StatusCode int
 	FinalURL   string
 	Title      string
+	// RedirectChain is every hop the visit took, in order, the final one
+	// included.
+	RedirectChain []Hop
+	// Headers are the final hop's response headers, verbatim.
+	Headers []Header
+	// TLS is nil when the final hop was not served over TLS.
+	TLS *TLS
 }
 
 // Capture is the record of one visit to one Target in one Run.
@@ -107,6 +153,9 @@ CREATE TABLE IF NOT EXISTS captures (
 	http_status     INTEGER,
 	final_url       TEXT,
 	title           TEXT,
+	headers         TEXT,
+	redirect_chain  TEXT,
+	tls             TEXT,
 	screenshot_path TEXT,
 	started_at      TEXT NOT NULL,
 	finished_at     TEXT NOT NULL
@@ -132,7 +181,55 @@ func Open(ctx context.Context, dir string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("preparing Store database: %w", err)
 	}
+	if err := addLaterColumns(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{dir: dir, db: db}, nil
+}
+
+// laterCaptureColumns are the nullable captures columns added after the table
+// was first written, newest last. A Store opened for the first time gets them
+// from schema; one written by an earlier seer gets them from addLaterColumns.
+// Add to both when a ticket adds a column.
+var laterCaptureColumns = []struct{ name, kind string }{
+	{"headers", "TEXT"},
+	{"redirect_chain", "TEXT"},
+	{"tls", "TEXT"},
+}
+
+// addLaterColumns brings a Store written by an earlier seer up to the current
+// schema. CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it
+// found it, so without this an older Store would reject every Capture written
+// to it and take the whole Run down with it.
+func addLaterColumns(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_table_info('captures')`)
+	if err != nil {
+		return fmt.Errorf("reading the Store's schema: %w", err)
+	}
+	defer rows.Close()
+	present := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("reading the Store's schema: %w", err)
+		}
+		present[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reading the Store's schema: %w", err)
+	}
+
+	for _, column := range laterCaptureColumns {
+		if present[column.name] {
+			continue
+		}
+		// The names are this file's own, never user input.
+		if _, err := db.ExecContext(ctx, "ALTER TABLE captures ADD COLUMN "+column.name+" "+column.kind); err != nil {
+			return fmt.Errorf("adding the %s column to the Store: %w", column.name, err)
+		}
+	}
+	return nil
 }
 
 // Close releases the database.
@@ -192,12 +289,16 @@ func (s *Store) AppendCapture(ctx context.Context, c Capture, screenshot []byte)
 	if c.Response != nil {
 		httpStatus, finalURL, title = c.Response.StatusCode, c.Response.FinalURL, c.Response.Title
 	}
-	_, err := s.db.ExecContext(ctx, `
+	headers, redirectChain, tlsSummary, err := responseColumns(c.Response)
+	if err != nil {
+		return Capture{}, err
+	}
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO captures
-			(id, run_id, position, target_url, input_line, status, error, http_status, final_url, title, screenshot_path, started_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, run_id, position, target_url, input_line, status, error, http_status, final_url, title, headers, redirect_chain, tls, screenshot_path, started_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.RunID, c.Position, c.Target, c.InputLine, c.Status, nullIfEmpty(c.Error),
-		httpStatus, finalURL, title, nullIfEmpty(c.ScreenshotPath),
+		httpStatus, finalURL, title, headers, redirectChain, tlsSummary, nullIfEmpty(c.ScreenshotPath),
 		FormatTime(c.StartedAt), FormatTime(c.FinishedAt))
 	if err != nil {
 		if c.ScreenshotPath != "" {
@@ -206,6 +307,38 @@ func (s *Store) AppendCapture(ctx context.Context, c Capture, screenshot []byte)
 		return Capture{}, fmt.Errorf("recording Capture: %w", err)
 	}
 	return c, nil
+}
+
+// responseColumns renders the parts of a Response the Store keeps as JSON.
+// Each is NULL when the visit observed nothing to keep.
+func responseColumns(r *Response) (headers, redirectChain, tlsSummary any, err error) {
+	if r == nil {
+		return nil, nil, nil, nil
+	}
+	if len(r.Headers) > 0 {
+		if headers, err = encodeJSON(r.Headers); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	if len(r.RedirectChain) > 0 {
+		if redirectChain, err = encodeJSON(r.RedirectChain); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	if r.TLS != nil {
+		if tlsSummary, err = encodeJSON(r.TLS); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return headers, redirectChain, tlsSummary, nil
+}
+
+func encodeJSON(v any) (any, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("encoding the Response: %w", err)
+	}
+	return string(b), nil
 }
 
 func newID() string {

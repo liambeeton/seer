@@ -94,9 +94,37 @@ type jsonlCapture struct {
 }
 
 type jsonlResponse struct {
-	Status   int    `json:"status"`
-	FinalURL string `json:"final_url"`
-	Title    string `json:"title"`
+	Status        int           `json:"status"`
+	FinalURL      string        `json:"final_url"`
+	Title         string        `json:"title"`
+	RedirectChain []jsonlHop    `json:"redirect_chain"`
+	Headers       []jsonlHeader `json:"headers"`
+	TLS           *jsonlTLS     `json:"tls"`
+}
+
+// jsonlHop is one (URL, status) step of the redirect chain.
+type jsonlHop struct {
+	URL    string `json:"url"`
+	Status int    `json:"status"`
+}
+
+// jsonlHeader is one response header, verbatim.
+type jsonlHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// jsonlTLS is the certificate summary, absent for an http Target.
+type jsonlTLS struct {
+	Subject   string   `json:"subject"`
+	SANs      []string `json:"sans"`
+	Issuer    string   `json:"issuer"`
+	ValidFrom string   `json:"valid_from"`
+	ValidTo   string   `json:"valid_to"`
+	Protocol  string   `json:"protocol"`
+	Cipher    string   `json:"cipher"`
+	Trusted   bool     `json:"trusted"`
+	Reason    string   `json:"reason"`
 }
 
 // captures decodes stdout as JSONL, failing on anything that is not one JSON

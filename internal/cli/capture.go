@@ -186,7 +186,31 @@ func storeResponse(r *capture.Response) *store.Response {
 	if r == nil {
 		return nil
 	}
-	return &store.Response{StatusCode: r.StatusCode, FinalURL: r.FinalURL, Title: r.Title}
+	out := &store.Response{
+		StatusCode: r.StatusCode,
+		FinalURL:   r.FinalURL,
+		Title:      r.Title,
+	}
+	for _, hop := range r.RedirectChain {
+		out.RedirectChain = append(out.RedirectChain, store.Hop{URL: hop.URL, Status: hop.Status})
+	}
+	for _, h := range r.Headers {
+		out.Headers = append(out.Headers, store.Header{Name: h.Name, Value: h.Value})
+	}
+	if r.TLS != nil {
+		out.TLS = &store.TLS{
+			Subject:   r.TLS.Subject,
+			SANs:      r.TLS.SANs,
+			Issuer:    r.TLS.Issuer,
+			ValidFrom: store.Timestamp(r.TLS.ValidFrom),
+			ValidTo:   store.Timestamp(r.TLS.ValidTo),
+			Protocol:  r.TLS.Protocol,
+			Cipher:    r.TLS.Cipher,
+			Trusted:   r.TLS.Trusted,
+			Reason:    r.TLS.Reason,
+		}
+	}
+	return out
 }
 
 // progress is the "<status or FAILED> <target>" part of a progress line.
@@ -202,7 +226,8 @@ func progress(c store.Capture) string {
 }
 
 // jsonlCapture is the --jsonl shape of a Capture: the row, with nulls where
-// the row has them.
+// the row has them. The redirect chain, headers and TLS summary are the Store's
+// own types, so a JSON line and the column it came from cannot drift apart.
 type jsonlCapture struct {
 	ID             string         `json:"id"`
 	RunID          string         `json:"run_id"`
@@ -218,9 +243,12 @@ type jsonlCapture struct {
 }
 
 type jsonlResponse struct {
-	Status   int    `json:"status"`
-	FinalURL string `json:"final_url"`
-	Title    string `json:"title"`
+	Status        int            `json:"status"`
+	FinalURL      string         `json:"final_url"`
+	Title         string         `json:"title"`
+	RedirectChain []store.Hop    `json:"redirect_chain"`
+	Headers       []store.Header `json:"headers"`
+	TLS           *store.TLS     `json:"tls"`
 }
 
 func writeJSONL(w io.Writer, c store.Capture) error {
@@ -237,7 +265,14 @@ func writeJSONL(w io.Writer, c store.Capture) error {
 		FinishedAt:     store.FormatTime(c.FinishedAt),
 	}
 	if c.Response != nil {
-		out.Response = &jsonlResponse{Status: c.Response.StatusCode, FinalURL: c.Response.FinalURL, Title: c.Response.Title}
+		out.Response = &jsonlResponse{
+			Status:        c.Response.StatusCode,
+			FinalURL:      c.Response.FinalURL,
+			Title:         c.Response.Title,
+			RedirectChain: c.Response.RedirectChain,
+			Headers:       c.Response.Headers,
+			TLS:           c.Response.TLS,
+		}
 	}
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)

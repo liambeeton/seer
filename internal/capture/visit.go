@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -20,13 +19,6 @@ const (
 	jpegQuality       = 85
 	closeTimeout      = 5 * time.Second
 )
-
-// Response is what the Target's server returned during the visit.
-type Response struct {
-	StatusCode int
-	FinalURL   string
-	Title      string
-}
 
 // Capture is the record of one visit to one Target: succeeded when the browser
 // produced a document (any status code), failed when it could not reach one.
@@ -102,6 +94,17 @@ func (b *Browser) visit(ctx context.Context, url string) (*Response, []byte, err
 	doc := watchDocument(page)
 	defer doc.stop()
 
+	// A broken certificate is what seer is looking for, not a reason to give
+	// up the visit: ignore the errors and let the security state, which the
+	// Security domain only reports once enabled, record the verdict instead.
+	// Both come after the watcher so that no state it reports is missed.
+	if err := (proto.SecurityEnable{}).Call(page); err != nil {
+		return nil, nil, fmt.Errorf("watching the security state: %w", err)
+	}
+	if err := (proto.SecuritySetIgnoreCertificateErrors{Ignore: true}).Call(page); err != nil {
+		return nil, nil, fmt.Errorf("ignoring certificate errors: %w", err)
+	}
+
 	nav := page.Timeout(navigationTimeout)
 	if err := nav.Navigate(url); err != nil {
 		return doc.response(), nil, err
@@ -141,46 +144,6 @@ func (b *Browser) visit(ctx context.Context, url string) (*Response, []byte, err
 		}
 	}
 	return resp, screenshot, nil
-}
-
-// documentWatcher records the main frame's latest document response, which is
-// the Response's status code and final URL.
-type documentWatcher struct {
-	mu   sync.Mutex
-	last *proto.NetworkResponse
-	stop func()
-}
-
-func watchDocument(page *rod.Page) *documentWatcher {
-	w := &documentWatcher{}
-	events, cancel := page.WithCancel()
-	wait := events.EachEvent(func(e *proto.NetworkResponseReceived) {
-		if e.Type != proto.NetworkResourceTypeDocument || e.FrameID != page.FrameID {
-			return
-		}
-		w.mu.Lock()
-		w.last = e.Response
-		w.mu.Unlock()
-	})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		wait()
-	}()
-	w.stop = func() {
-		cancel()
-		<-done
-	}
-	return w
-}
-
-func (w *documentWatcher) response() *Response {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.last == nil {
-		return nil
-	}
-	return &Response{StatusCode: w.last.Status, FinalURL: w.last.URL}
 }
 
 // reason turns a visit error into the failure reason recorded on the Capture.
