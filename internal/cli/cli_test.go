@@ -21,20 +21,20 @@ import (
 	"github.com/liambeeton/seer/internal/cli"
 )
 
-// result is everything a user can observe from one seer invocation besides
-// the Store's files.
-type result struct {
+// invocation is everything a user can observe from one seer invocation
+// besides the Store's files.
+type invocation struct {
 	stdout, stderr string
 	code           int
 }
 
 // seer runs one invocation through the cli.Run seam with an empty stdin.
-func seer(t *testing.T, args ...string) result {
+func seer(t *testing.T, args ...string) invocation {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	code := cli.Run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	t.Logf("seer %s\n  exit %d\n  stdout: %q\n  stderr: %q", strings.Join(args, " "), code, stdout.String(), stderr.String())
-	return result{stdout: stdout.String(), stderr: stderr.String(), code: code}
+	return invocation{stdout: stdout.String(), stderr: stderr.String(), code: code}
 }
 
 // browserFlags never lets a test download a browser. SEER_TEST_BROWSER points
@@ -181,6 +181,9 @@ func TestCapture_ReachableTargetYieldsSucceededCapture(t *testing.T) {
 	if c.Response.Title != "Fixture 200" {
 		t.Errorf("response.title = %q, want the JavaScript-set title %q", c.Response.Title, "Fixture 200")
 	}
+	if !strings.Contains(r.stderr, "[1/1] 200 "+target) {
+		t.Errorf("stderr progress should read \"[1/1] 200 <target>\", got %q", r.stderr)
+	}
 	if c.ScreenshotPath == nil || *c.ScreenshotPath != "screenshots/"+c.ID+".jpg" {
 		t.Fatalf("screenshot_path = %v, want screenshots/%s.jpg", c.ScreenshotPath, c.ID)
 	}
@@ -204,12 +207,12 @@ func TestCapture_ReachableTargetYieldsSucceededCapture(t *testing.T) {
 	if header[18] != 2 || header[19] != 2 {
 		t.Errorf("seer.db is not in WAL mode (format versions %d/%d, want 2/2)", header[18], header[19])
 	}
-	shot, err := os.Open(filepath.Join(store, filepath.FromSlash(*c.ScreenshotPath)))
+	screenshot, err := os.Open(filepath.Join(store, filepath.FromSlash(*c.ScreenshotPath)))
 	if err != nil {
 		t.Fatalf("Screenshot: %v", err)
 	}
-	defer shot.Close()
-	cfg, format, err := image.DecodeConfig(shot)
+	defer screenshot.Close()
+	cfg, format, err := image.DecodeConfig(screenshot)
 	if err != nil {
 		t.Fatalf("Screenshot is not a decodable image: %v", err)
 	}
@@ -265,15 +268,15 @@ func TestCapture_RefusedConnectionYieldsFailedCapture(t *testing.T) {
 	assertUTCTimestamp(t, "started_at", c.StartedAt)
 	assertUTCTimestamp(t, "finished_at", c.FinishedAt)
 
-	shots, err := filepath.Glob(filepath.Join(store, "screenshots", "*"))
+	screenshots, err := filepath.Glob(filepath.Join(store, "screenshots", "*"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(shots) != 0 {
-		t.Errorf("a failed Capture must not leave a Screenshot, found %v", shots)
+	if len(screenshots) != 0 {
+		t.Errorf("a failed Capture must not leave a Screenshot, found %v", screenshots)
 	}
-	if !strings.Contains(r.stderr, "failed") {
-		t.Errorf("stderr progress should say the Capture failed, got %q", r.stderr)
+	if !strings.Contains(r.stderr, "[1/1] FAILED "+target) {
+		t.Errorf("stderr progress should read \"[1/1] FAILED <target>\", got %q", r.stderr)
 	}
 }
 
@@ -321,9 +324,9 @@ func TestCapture_WithoutJSONLStdoutStaysEmpty(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(store, "seer.db")); err != nil {
 		t.Errorf("the Capture should still be recorded: %v", err)
 	}
-	shots, _ := filepath.Glob(filepath.Join(store, "screenshots", "*.jpg"))
-	if len(shots) != 1 {
-		t.Errorf("want exactly one Screenshot, found %v", shots)
+	screenshots, _ := filepath.Glob(filepath.Join(store, "screenshots", "*.jpg"))
+	if len(screenshots) != 1 {
+		t.Errorf("want exactly one Screenshot, found %v", screenshots)
 	}
 }
 

@@ -50,18 +50,31 @@ func (c Capture) Succeeded() bool { return c.Error == "" }
 // error; the error return is reserved for the Run being stopped through ctx.
 func (b *Browser) Visit(ctx context.Context, url string) (Capture, error) {
 	c := Capture{Target: url, StartedAt: now()}
-	resp, shot, err := b.visit(ctx, url)
+	resp, screenshot, err := b.visit(ctx, url)
 	c.FinishedAt = now()
 	c.Response = resp
 	if err != nil {
 		if ctx.Err() != nil {
 			return Capture{}, ctx.Err()
 		}
+		// A visit error is the Target's fault only while the browser itself
+		// is still there to blame it on.
+		if err := b.ping(ctx); err != nil {
+			return Capture{}, fmt.Errorf("browser unavailable: %w", err)
+		}
 		c.Error = reason(err)
 		return c, nil
 	}
-	c.Screenshot = shot
+	c.Screenshot = screenshot
 	return c, nil
+}
+
+// ping fails when the browser no longer answers.
+func (b *Browser) ping(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, closeTimeout)
+	defer cancel()
+	_, err := proto.BrowserGetVersion{}.Call(b.rod.Context(ctx))
+	return err
 }
 
 func (b *Browser) visit(ctx context.Context, url string) (*Response, []byte, error) {
@@ -109,12 +122,12 @@ func (b *Browser) visit(ctx context.Context, url string) (*Response, []byte, err
 		return doc.response(), nil, fmt.Errorf("reading title: %w", err)
 	}
 	quality := jpegQuality
-	shot, err := after.Screenshot(false, &proto.PageCaptureScreenshot{
+	screenshot, err := after.Screenshot(false, &proto.PageCaptureScreenshot{
 		Format:  proto.PageCaptureScreenshotFormatJpeg,
 		Quality: &quality,
 	})
 	if err != nil {
-		return doc.response(), nil, fmt.Errorf("taking screenshot: %w", err)
+		return doc.response(), nil, fmt.Errorf("taking Screenshot: %w", err)
 	}
 
 	resp := doc.response()
@@ -127,7 +140,7 @@ func (b *Browser) visit(ctx context.Context, url string) (*Response, []byte, err
 			resp.FinalURL = info.URL
 		}
 	}
-	return resp, shot, nil
+	return resp, screenshot, nil
 }
 
 // documentWatcher records the main frame's latest document response, which is
@@ -182,8 +195,8 @@ func reason(err error) string {
 	return err.Error()
 }
 
-// now is the visit clock: UTC at whole seconds, the precision stored and
-// streamed as RFC 3339.
+// now is the visit clock: UTC at millisecond precision, which is what the
+// Store keeps and the JSONL streams.
 func now() time.Time {
-	return time.Now().UTC().Truncate(time.Second)
+	return time.Now().UTC().Truncate(time.Millisecond)
 }

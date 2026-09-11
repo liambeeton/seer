@@ -33,7 +33,7 @@ func newCaptureCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVarP(&opts.storeDir, "output", "o", "./seer-store", "Store directory (created on first use)")
+	f.StringVarP(&opts.storeDir, "store", "o", "./seer-store", "Store directory (created on first use)")
 	f.BoolVar(&opts.jsonl, "jsonl", false, "write one JSON object per Capture to stdout as it completes")
 	f.StringVar(&opts.browserPath, "browser-path", "", "Chrome/Chromium binary to use instead of looking one up")
 	f.BoolVar(&opts.noDownload, "no-download", false, "fail instead of downloading a browser when none is found")
@@ -70,35 +70,37 @@ func runCapture(cmd *cobra.Command, opts captureOptions, urls []string) error {
 		return exitWith(ExitUsage, err)
 	}
 
+	done := 0
 	for i, t := range targets {
-		visited, err := browser.Visit(ctx, t.URL)
+		captured, err := browser.Visit(ctx, t.URL)
 		if err != nil {
 			return abort(st, run.ID, err)
 		}
-		rec, err := st.AppendCapture(ctx, store.Capture{
+		stored, err := st.AppendCapture(ctx, store.Capture{
 			RunID:      run.ID,
 			Position:   i + 1,
 			Target:     t.URL,
-			Status:     captureStatus(visited),
-			Error:      visited.Error,
-			Response:   storeResponse(visited.Response),
-			StartedAt:  visited.StartedAt,
-			FinishedAt: visited.FinishedAt,
-		}, visited.Screenshot)
+			Status:     captureStatus(captured),
+			Error:      captured.Error,
+			Response:   storeResponse(captured.Response),
+			StartedAt:  captured.StartedAt,
+			FinishedAt: captured.FinishedAt,
+		}, captured.Screenshot)
 		if err != nil {
 			return abort(st, run.ID, err)
 		}
+		done++
 
-		fmt.Fprintf(stderr, "[%d/%d] %s\n", rec.Position, len(targets), progress(rec))
+		fmt.Fprintf(stderr, "[%d/%d] %s\n", done, len(targets), progress(stored))
 		if opts.jsonl {
-			if err := writeJSONL(stdout, rec); err != nil {
+			if err := writeJSONL(stdout, stored); err != nil {
 				return abort(st, run.ID, err)
 			}
 		}
 	}
 
 	if err := st.FinishRun(ctx, run.ID, store.RunCompleted); err != nil {
-		return exitWith(ExitAborted, err)
+		return abort(st, run.ID, err)
 	}
 	return nil
 }
@@ -129,11 +131,11 @@ func storeResponse(r *capture.Response) *store.Response {
 	return &store.Response{StatusCode: r.StatusCode, FinalURL: r.FinalURL, Title: r.Title}
 }
 
-// progress is the human-readable part of a progress line.
+// progress is the "<status or FAILED> <target>" part of a progress line.
 func progress(c store.Capture) string {
 	switch {
 	case c.Status == store.CaptureFailed:
-		return fmt.Sprintf("failed %s (%s)", c.Target, c.Error)
+		return fmt.Sprintf("FAILED %s (%s)", c.Target, c.Error)
 	case c.Response == nil:
 		return fmt.Sprintf("succeeded %s", c.Target)
 	default:
@@ -152,8 +154,8 @@ type jsonlCapture struct {
 	Error          *string        `json:"error"`
 	Response       *jsonlResponse `json:"response"`
 	ScreenshotPath *string        `json:"screenshot_path"`
-	StartedAt      time.Time      `json:"started_at"`
-	FinishedAt     time.Time      `json:"finished_at"`
+	StartedAt      string         `json:"started_at"`
+	FinishedAt     string         `json:"finished_at"`
 }
 
 type jsonlResponse struct {
@@ -171,8 +173,8 @@ func writeJSONL(w io.Writer, c store.Capture) error {
 		Status:         string(c.Status),
 		Error:          nullable(c.Error),
 		ScreenshotPath: nullable(c.ScreenshotPath),
-		StartedAt:      c.StartedAt,
-		FinishedAt:     c.FinishedAt,
+		StartedAt:      store.FormatTime(c.StartedAt),
+		FinishedAt:     store.FormatTime(c.FinishedAt),
 	}
 	if c.Response != nil {
 		out.Response = &jsonlResponse{Status: c.Response.StatusCode, FinalURL: c.Response.FinalURL, Title: c.Response.Title}

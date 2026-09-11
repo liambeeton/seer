@@ -19,8 +19,16 @@ import (
 const (
 	dbFile         = "seer.db"
 	screenshotsDir = "screenshots"
-	timeLayout     = time.RFC3339
 )
+
+// TimeLayout is how the Store writes every timestamp: UTC RFC 3339 at a
+// fixed millisecond width, so the text sorts chronologically.
+const TimeLayout = "2006-01-02T15:04:05.000Z07:00"
+
+// FormatTime renders t the way the Store stores it.
+func FormatTime(t time.Time) string {
+	return t.UTC().Format(TimeLayout)
+}
 
 // RunStatus is the lifecycle state of a Run.
 type RunStatus string
@@ -138,7 +146,7 @@ func (s *Store) CreateRun(ctx context.Context, targetCount int) (Run, error) {
 	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO runs (id, started_at, status, target_count) VALUES (?, ?, ?, ?)`,
-		run.ID, formatTime(run.StartedAt), run.Status, run.TargetCount)
+		run.ID, FormatTime(run.StartedAt), run.Status, run.TargetCount)
 	if err != nil {
 		return Run{}, fmt.Errorf("creating Run: %w", err)
 	}
@@ -152,7 +160,7 @@ func (s *Store) FinishRun(ctx context.Context, id string, status RunStatus) erro
 	}
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE runs SET status = ?, finished_at = ? WHERE id = ?`,
-		status, formatTime(now()), id)
+		status, FormatTime(now()), id)
 	if err != nil {
 		return fmt.Errorf("finishing Run %s: %w", id, err)
 	}
@@ -186,7 +194,7 @@ func (s *Store) AppendCapture(ctx context.Context, c Capture, screenshot []byte)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.RunID, c.Position, c.Target, c.Status, nullIfEmpty(c.Error),
 		httpStatus, finalURL, title, nullIfEmpty(c.ScreenshotPath),
-		formatTime(c.StartedAt), formatTime(c.FinishedAt))
+		FormatTime(c.StartedAt), FormatTime(c.FinishedAt))
 	if err != nil {
 		if c.ScreenshotPath != "" {
 			_ = os.Remove(filepath.Join(s.dir, filepath.FromSlash(c.ScreenshotPath)))
@@ -201,11 +209,7 @@ func newID() string {
 }
 
 func now() time.Time {
-	return time.Now().UTC().Truncate(time.Second)
-}
-
-func formatTime(t time.Time) string {
-	return t.UTC().Format(timeLayout)
+	return time.Now().UTC().Truncate(time.Millisecond)
 }
 
 func nullIfEmpty(s string) any {
